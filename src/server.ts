@@ -43,6 +43,14 @@ export function startServer(port = 3000) {
     async fetch(req: Request): Promise<Response> {
       const url = new URL(req.url);
 
+      // ADD THIS NEW /EXIT ROUTE
+      if (url.pathname === "/exit") {
+        console.log("Received exit command. Shutting down...");
+        stopScheduler(); // Stop the background tasks
+        setTimeout(() => server.stop(), 100); // Stop the server after responding
+        return new Response("Server shutting down gracefully...", { status: 200 });
+      }
+
       if (url.pathname !== "/search") {
         return new Response("Not Found", { status: 404 });
       }
@@ -58,6 +66,11 @@ export function startServer(port = 3000) {
           return Response.json([]);
         }
 
+        // ADD PAGINATION PARSING HERE
+        const page = parseInt(url.searchParams.get("page") || "1", 10);
+        const limit = parseInt(url.searchParams.get("limit") || "10", 10);
+        const offset = (page - 1) * limit;
+
         const { isNew } = recordQuery(q);
         if (isNew) {
           void ingest(q).catch((error) => {
@@ -65,8 +78,15 @@ export function startServer(port = 3000) {
           });
         }
 
-        const results = await search(q);
-        return Response.json(results);
+        // PASS LIMIT AND OFFSET TO SEARCH
+        const results = await search(q, limit, offset);
+
+        // Return pagination metadata along with results
+        return Response.json({
+          page,
+          limit,
+          results
+        });
       } catch (error) {
         console.error("Search request failed:", error);
         return Response.json({ error: "Internal server error" }, { status: 500 });

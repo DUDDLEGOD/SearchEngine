@@ -27,3 +27,11 @@ export function startScheduler(intervalMs: number) {
     void runSchedulerCycle();
   }, intervalMs);
 }
+
+export function stopScheduler() {
+  if (intervalId) {
+    clearInterval(intervalId);
+    intervalId = null;
+    console.log("Ingestion scheduler stopped.");
+  }
+}

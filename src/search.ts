@@ -53,7 +53,7 @@ const docFullStmt = db.query<DocFullRow, [number]>(
   "SELECT title, url, clean_text FROM documents WHERE id = ?"
 );
 
-export async function search(query: string): Promise<SearchResult[]> {
+export async function search(query: string, limit: number = 10, offset: number = 0): Promise<SearchResult[]> {
   const startTime = performance.now();
 
   const rawQuery = query.trim().toLowerCase();
@@ -96,6 +96,13 @@ export async function search(query: string): Promise<SearchResult[]> {
       scores.set(posting.document_id, (scores.get(posting.document_id) ?? 0) + score);
     }
   }
+
+  // USE PAGINATION PARAMETERS HERE
+  const ranked = [...scores.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(offset, offset + limit);
+
+  const finalResults: SearchResult[] = [];
 
   const ranked = [...scores.entries()]
     .sort((a, b) => b[1] - a[1])
