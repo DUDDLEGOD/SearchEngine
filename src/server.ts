@@ -1,10 +1,25 @@
+import { config } from "./config";
+import { db } from "./db";
 import { ingest } from "./ingestion/orchestrator";
+import { type ErrorPayload, HttpError, errorResponse, toErrorPayload, unknownErrorResponse } from "./http/errors";
+import { parseLegacySearchParams, parseSuggestParams, parseV1SearchParams } from "./http/validation";
+import { log, logRequest } from "./logging";
+import {
+  recordRateLimitRejection,
+  recordSearchLatency,
+  recordSearchRequest,
+  renderPrometheusMetrics,
+} from "./metrics";
+import { getOpenApiSpec } from "./openapi";
 import { recordQuery } from "./queryLog";
-import { search } from "./search";
+import { TokenBucketRateLimiter } from "./rateLimit/tokenBucket";
+import { search, searchV1, suggest } from "./search";
+import type { SuggestionResponse } from "./types/api";
 
-const requestLog = new Map<string, { count: number; lastReset: number }>();
-const RATE_LIMIT = 20;
-const WINDOW_MS = 60_000;
+const rateLimiter = new TokenBucketRateLimiter(
+  config.RATE_LIMIT_CAPACITY,
+  config.RATE_LIMIT_REFILL_PER_SEC
+);
 
 function getClientIp(req: Request): string {
   const forwardedFor = req.headers.get("x-forwarded-for");
@@ -18,82 +33,253 @@ function getClientIp(req: Request): string {
   return req.headers.get("host") ?? "local";
 }
 
-function isRateLimited(ip: string): boolean {
-  const now = Date.now();
-  const record = requestLog.get(ip);
-
-  if (!record) {
-    requestLog.set(ip, { count: 1, lastReset: now });
-    return false;
+function isOriginAllowed(origin: string | null): boolean {
+  if (!origin) {
+    return true;
   }
 
-  if (now - record.lastReset > WINDOW_MS) {
-    record.count = 1;
-    record.lastReset = now;
-    return false;
+  if (config.CORS_ALLOW_ORIGIN_LIST.includes("*")) {
+    return true;
   }
 
-  record.count += 1;
-  return record.count > RATE_LIMIT;
+  return config.CORS_ALLOW_ORIGIN_LIST.includes(origin);
 }
 
-export function startServer(port = 3000) {
+function applyCorsHeaders(req: Request, headers: Headers): void {
+  const origin = req.headers.get("origin");
+  if (config.CORS_ALLOW_ORIGIN_LIST.includes("*")) {
+    headers.set("Access-Control-Allow-Origin", "*");
+  } else if (origin && config.CORS_ALLOW_ORIGIN_LIST.includes(origin)) {
+    headers.set("Access-Control-Allow-Origin", origin);
+    headers.set("Vary", "Origin");
+  }
+
+  headers.set("Access-Control-Allow-Methods", "GET,OPTIONS");
+  headers.set("Access-Control-Allow-Headers", "Content-Type,x-api-key");
+}
+
+function withCors(req: Request, response: Response): Response {
+  const headers = new Headers(response.headers);
+  applyCorsHeaders(req, headers);
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function jsonWithCors(req: Request, body: unknown, status = 200): Response {
+  return withCors(req, Response.json(body, { status }));
+}
+
+function checkApiKey(pathname: string, req: Request): void {
+  if (!config.API_KEY_ENABLED) {
+    return;
+  }
+
+  if (!pathname.startsWith("/v1/")) {
+    return;
+  }
+
+  const key = req.headers.get("x-api-key");
+  if (!key || key !== config.API_KEY_VALUE) {
+    throw new HttpError(401, "UNAUTHORIZED", "Missing or invalid API key");
+  }
+}
+
+function ensureCorsAllowed(req: Request): void {
+  const origin = req.headers.get("origin");
+  if (!isOriginAllowed(origin)) {
+    throw new HttpError(403, "CORS_FORBIDDEN", "Origin is not allowed", { origin });
+  }
+}
+
+function validateRateLimit(ip: string): void {
+  const allowed = rateLimiter.consume(ip);
+  if (!allowed) {
+    recordRateLimitRejection();
+    throw new HttpError(429, "RATE_LIMITED", "Rate limit exceeded");
+  }
+}
+
+function createNotFound(requestId: string): ErrorPayload {
+  return toErrorPayload(requestId, "NOT_FOUND", "Not Found");
+}
+
+export function startServer(port = config.PORT) {
   const server = Bun.serve({
     port,
     async fetch(req: Request): Promise<Response> {
+      const requestId = crypto.randomUUID();
+      const startedAt = performance.now();
       const url = new URL(req.url);
+      const path = url.pathname;
+      const ip = getClientIp(req);
 
-      // ADD THIS NEW /EXIT ROUTE
-      if (url.pathname === "/exit") {
-        console.log("Received exit command. Shutting down...");
-        stopScheduler(); // Stop the background tasks
-        setTimeout(() => server.stop(), 100); // Stop the server after responding
-        return new Response("Server shutting down gracefully...", { status: 200 });
-      }
-
-      if (url.pathname !== "/search") {
-        return new Response("Not Found", { status: 404 });
-      }
+      let status = 200;
+      let response: Response;
 
       try {
-        const clientIp = getClientIp(req);
-        if (isRateLimited(clientIp)) {
-          return Response.json({ error: "Rate limit exceeded" }, { status: 429 });
+        ensureCorsAllowed(req);
+
+        if (req.method === "OPTIONS") {
+          response = withCors(req, new Response(null, { status: 204 }));
+          status = response.status;
+          return response;
         }
 
-        const q = url.searchParams.get("q")?.trim();
-        if (!q) {
-          return Response.json([]);
+        checkApiKey(path, req);
+
+        if (path === "/health") {
+          response = jsonWithCors(req, { status: "ok", requestId });
+          status = response.status;
+          return response;
         }
 
-        // ADD PAGINATION PARSING HERE
-        const page = parseInt(url.searchParams.get("page") || "1", 10);
-        const limit = parseInt(url.searchParams.get("limit") || "10", 10);
-        const offset = (page - 1) * limit;
+        if (path === "/ready") {
+          const readinessStmt = db.query<{ ok: number }, []>("SELECT 1 as ok");
+          const ok = readinessStmt.get()?.ok === 1;
+          if (!ok) {
+            response = withCors(
+              req,
+              errorResponse(requestId, 503, "NOT_READY", "Service is not ready")
+            );
+            status = response.status;
+            return response;
+          }
 
-        const { isNew } = recordQuery(q);
-        if (isNew) {
-          void ingest(q).catch((error) => {
-            console.error(`Background ingestion failed for "${q}":`, error);
-          });
+          response = jsonWithCors(req, { status: "ready", requestId });
+          status = response.status;
+          return response;
         }
 
-        // PASS LIMIT AND OFFSET TO SEARCH
-        const results = await search(q, limit, offset);
+        if (path === "/metrics") {
+          response = withCors(
+            req,
+            new Response(renderPrometheusMetrics(), {
+              status: 200,
+              headers: { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" },
+            })
+          );
+          status = response.status;
+          return response;
+        }
 
-        // Return pagination metadata along with results
-        return Response.json({
-          page,
-          limit,
-          results
-        });
+        if (path === "/openapi.json") {
+          response = jsonWithCors(req, getOpenApiSpec());
+          status = response.status;
+          return response;
+        }
+
+        if (path === "/v1/suggest") {
+          validateRateLimit(ip);
+          const parsed = parseSuggestParams(url.searchParams);
+          const suggestions = await suggest(parsed.query, parsed.limit);
+          const payload: SuggestionResponse = {
+            query: parsed.query,
+            suggestions,
+          };
+          response = jsonWithCors(req, payload);
+          status = response.status;
+          recordSearchRequest(path, status);
+          return response;
+        }
+
+        if (path === "/v1/search") {
+          validateRateLimit(ip);
+          const parsed = parseV1SearchParams(url.searchParams);
+          const { isNew } = recordQuery(parsed.query);
+          if (isNew) {
+            void ingest(parsed.query).catch((error) => {
+              log("error", "ingestion.background.failed", {
+                requestId,
+                query: parsed.query,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+          }
+
+          const envelope = await searchV1(parsed);
+          response = jsonWithCors(req, envelope);
+          status = response.status;
+          recordSearchRequest(path, status);
+          return response;
+        }
+
+        if (path === "/search") {
+          validateRateLimit(ip);
+          const parsed = parseLegacySearchParams(url.searchParams);
+          const offset = (parsed.page - 1) * parsed.limit;
+
+          const { isNew } = recordQuery(parsed.query);
+          if (isNew) {
+            void ingest(parsed.query).catch((error) => {
+              log("error", "ingestion.background.failed", {
+                requestId,
+                query: parsed.query,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+          }
+
+          const results = await search(parsed.query, parsed.limit, offset);
+          response = jsonWithCors(req, results);
+          status = response.status;
+          recordSearchRequest(path, status);
+          return response;
+        }
+
+        response = jsonWithCors(req, createNotFound(requestId), 404);
+        status = 404;
+        return response;
       } catch (error) {
-        console.error("Search request failed:", error);
-        return Response.json({ error: "Internal server error" }, { status: 500 });
+        if (error instanceof HttpError) {
+          response = withCors(
+            req,
+            errorResponse(
+              requestId,
+              error.status,
+              error.code,
+              error.message,
+              error.details
+            )
+          );
+          status = error.status;
+          if (path === "/search" || path.startsWith("/v1/")) {
+            recordSearchRequest(path, status);
+          }
+          return response;
+        }
+
+        log("error", "http.unhandled", {
+          requestId,
+          path,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        response = withCors(req, unknownErrorResponse(requestId));
+        status = 500;
+        if (path === "/search" || path.startsWith("/v1/")) {
+          recordSearchRequest(path, status);
+        }
+        return response;
+      } finally {
+        const latencyMs = performance.now() - startedAt;
+        if (path === "/search" || path.startsWith("/v1/")) {
+          recordSearchLatency(path, latencyMs);
+        }
+        logRequest({
+          requestId,
+          method: req.method,
+          path,
+          status,
+          latencyMs: Number(latencyMs.toFixed(2)),
+          ip,
+        });
       }
     },
   });
 
-  console.log(`Server running on http://localhost:${port}`);
+  log("info", "server.started", { port: server.port });
   return server;
 }

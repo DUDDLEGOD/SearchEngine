@@ -22,10 +22,10 @@ type WikipediaSummaryResponse = {
 export const WikipediaAdapter: SourceAdapter = {
   name: "wikipedia",
 
-  async fetch(query: string): Promise<IngestedDocument[]> {
+  async fetch(query: string, context): Promise<IngestedDocument[]> {
     const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&format=json`;
 
-    const res = await fetch(searchUrl);
+    const res = await fetch(searchUrl, { signal: context?.signal });
     if (!res.ok) {
       console.error(`Wikipedia search failed with status ${res.status}`);
       return [];
@@ -37,10 +37,11 @@ export const WikipediaAdapter: SourceAdapter = {
       return [];
     }
 
-    const pagePromises = topResults.map(async (item) => {
+    const pagePromises: Array<Promise<IngestedDocument | null>> = topResults.map(async (item) => {
       try {
         const pageRes = await fetch(
-          `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(item.title)}`
+          `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(item.title)}`,
+          { signal: context?.signal }
         );
 
         if (!pageRes.ok) {
@@ -55,12 +56,14 @@ export const WikipediaAdapter: SourceAdapter = {
           return null;
         }
 
-        return {
+        const doc: IngestedDocument = {
           url: pageUrl,
           title: item.title,
           content: extract,
           source: "wikipedia",
-        } satisfies IngestedDocument;
+          language: "en",
+        };
+        return doc;
       } catch {
         return null;
       }

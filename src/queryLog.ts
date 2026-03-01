@@ -49,3 +49,21 @@ export function getTopQueries(limit: number): string[] {
   const rows = topQueriesStmt.all(limit);
   return rows.map((row) => row.query);
 }
+
+export function getQuerySuggestions(prefix: string, limit: number): string[] {
+  const normalizedPrefix = prefix.trim().toLowerCase();
+  if (!normalizedPrefix || limit <= 0) {
+    return [];
+  }
+
+  const suggestionStmt = db.query<QueryRow, [string, number]>(
+    `SELECT query
+     FROM queries
+     WHERE query LIKE ?
+     ORDER BY hit_count DESC, last_seen_at DESC
+     LIMIT ?`
+  );
+
+  const rows = suggestionStmt.all(`${normalizedPrefix}%`, limit);
+  return rows.map((row) => row.query);
+}

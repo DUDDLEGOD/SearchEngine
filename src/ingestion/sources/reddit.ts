@@ -17,10 +17,11 @@ type RedditSearchResponse = {
 export const RedditAdapter: SourceAdapter = {
   name: "reddit",
 
-  async fetch(query: string): Promise<IngestedDocument[]> {
+  async fetch(query: string, context): Promise<IngestedDocument[]> {
     try {
       const url = `https://www.reddit.com/search.json?q=${encodeURIComponent(query)}&limit=5`;
       const res = await fetch(url, {
+        signal: context?.signal,
         headers: {
           "User-Agent": "SearchEngineBot/1.0",
         },
@@ -46,6 +47,7 @@ export const RedditAdapter: SourceAdapter = {
           title: postData.title,
           content: `${postData.title} ${postData.selftext}`,
           source: "reddit",
+          language: "en",
         });
       }
 

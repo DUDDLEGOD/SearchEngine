@@ -11,19 +11,19 @@ const seedDocs: IngestedDocument[] = [
     url: "doc1",
     title: "Search Engine Design",
     content: "Search engine design and ranking algorithms",
-    source: "test",
+    source: "wikipedia",
   },
   {
     url: "doc2",
     title: "Machine Learning Basics",
     content: "Machine learning improves search engine accuracy",
-    source: "test",
+    source: "wikipedia",
   },
   {
     url: "doc3",
     title: "Cooking Pasta Recipe",
     content: "Cooking pasta with tomato sauce and cheese",
-    source: "test",
+    source: "wikipedia",
   },
 ];
 
@@ -33,10 +33,12 @@ type QueryHitRow = { hit_count: number };
 
 function resetDatabase() {
   db.exec(`
+    DROP TABLE IF EXISTS term_positions;
     DROP TABLE IF EXISTS inverted_index;
     DROP TABLE IF EXISTS terms;
     DROP TABLE IF EXISTS documents;
     DROP TABLE IF EXISTS queries;
+    DROP TABLE IF EXISTS schema_migrations;
   `);
   initDb();
 }
